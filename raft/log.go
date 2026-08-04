@@ -90,7 +90,36 @@ func newLog(storage Storage) *RaftLog {
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
-	// Your Code Here (2C).
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+
+	// entries[0] is the dummy entry immediately before firstIndex. Keep it
+	// until storage has moved past it, then drop the entries covered by the
+	// storage snapshot/compaction. This keeps the in-memory log bounded while
+	// retaining the term needed for the next AppendEntries consistency check.
+	offset := l.entries[0].Index
+	if firstIndex <= offset+1 {
+		return
+	}
+
+	lastIndex := l.LastIndex()
+	if firstIndex <= lastIndex {
+		start := firstIndex - 1 - offset
+		entries := make([]pb.Entry, len(l.entries)-int(start))
+		copy(entries, l.entries[start:])
+		l.entries = entries
+	} else {
+		term, err := l.storage.Term(firstIndex - 1)
+		if err != nil {
+			panic(err)
+		}
+		l.entries = []pb.Entry{{Index: firstIndex - 1, Term: term}}
+	}
+	if l.stabled < l.entries[0].Index {
+		l.stabled = l.entries[0].Index
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -108,19 +137,36 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		return []pb.Entry{}
 	}
 	offset := l.entries[0].Index
-	entries := make([]pb.Entry, len(l.entries[l.stabled+1-offset:]))
-	copy(entries, l.entries[l.stabled+1-offset:])
+	start := uint64(1) // never expose the dummy entry as an unstable entry
+	if l.stabled >= offset {
+		start = l.stabled + 1 - offset
+	}
+	if start >= uint64(len(l.entries)) {
+		return []pb.Entry{}
+	}
+	entries := make([]pb.Entry, len(l.entries[start:]))
+	copy(entries, l.entries[start:])
 	return entries
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	if l.applied >= l.committed {
+	// A pending snapshot must be applied by the upper layer before any log
+	// entries following it are exposed as committed entries.
+	if l.pendingSnapshot != nil || l.applied >= l.committed {
 		return []pb.Entry{}
 	}
 	offset := l.entries[0].Index
-	ents = make([]pb.Entry, len(l.entries[l.applied+1-offset:l.committed+1-offset]))
-	copy(ents, l.entries[l.applied+1-offset:l.committed+1-offset])
+	lo := l.applied + 1
+	if lo <= offset {
+		lo = offset + 1
+	}
+	hi := min(l.committed, l.LastIndex())
+	if lo > hi {
+		return []pb.Entry{}
+	}
+	ents = make([]pb.Entry, len(l.entries[lo-offset:hi+1-offset]))
+	copy(ents, l.entries[lo-offset:hi+1-offset])
 	return ents
 }
 

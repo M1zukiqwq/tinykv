@@ -4,12 +4,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Connor1996/badger"
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -42,7 +46,228 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	rd := d.RaftGroup.Ready()
+	// 1) Persist HardState / Entries (and Snapshot when 2C is implemented).
+	applySnapResult, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		panic(err)
+	}
+	if applySnapResult != nil && applySnapResult.Region != nil {
+		// The snapshot may carry newer region metadata. The durable region
+		// state was written by PeerStorage; update the live peer before it
+		// handles any subsequent messages or proposals.
+		d.SetRegion(applySnapResult.Region)
+	}
+	// 2) Send raft messages only after the corresponding state is durable.
+	d.Send(d.ctx.trans, rd.Messages)
+	// 3) Apply committed entries to the KV state machine and answer proposals.
+	for _, entry := range rd.CommittedEntries {
+		d.processCommittedEntry(entry)
+		if d.stopped {
+			return
+		}
+	}
+	// 4) Tell Raft we have consumed this Ready.
+	d.RaftGroup.Advance(rd)
+}
+
+// processCommittedEntry applies one committed raft log entry.
+func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry) {
+	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		// Membership changes are handled in Project 3; still advance applied index.
+		d.persistAppliedIndex(entry.Index)
+		return
+	}
+	// Empty data is the leader's noop entry after election.
+	if len(entry.Data) == 0 {
+		d.persistAppliedIndex(entry.Index)
+		return
+	}
+
+	req := &raft_cmdpb.RaftCmdRequest{}
+	if err := req.Unmarshal(entry.Data); err != nil {
+		panic(err)
+	}
+
+	if req.AdminRequest != nil {
+		d.execAdminRequest(req, entry)
+		return
+	}
+	d.execNormalRequest(req, entry)
+}
+
+func (d *peerMsgHandler) persistAppliedIndex(index uint64) {
+	d.peerStorage.applyState.AppliedIndex = index
+	kvWB := new(engine_util.WriteBatch)
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		panic(err)
+	}
+	if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+		panic(err)
+	}
+}
+
+func (d *peerMsgHandler) execAdminRequest(req *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry) {
+	admin := req.AdminRequest
+	kvWB := new(engine_util.WriteBatch)
+	resp := newCmdResp()
+	BindRespTerm(resp, d.Term())
+
+	switch admin.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// Update truncated metadata; actual log deletion is async via raftlog-gc worker.
+		compact := admin.GetCompactLog()
+		if compact.GetCompactIndex() >= d.peerStorage.applyState.TruncatedState.Index {
+			d.peerStorage.applyState.TruncatedState.Index = compact.GetCompactIndex()
+			d.peerStorage.applyState.TruncatedState.Term = compact.GetCompactTerm()
+			d.ScheduleCompactLog(compact.GetCompactIndex())
+		}
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+			CompactLog: &raft_cmdpb.CompactLogResponse{},
+		}
+	default:
+		// Other admin commands (TransferLeader / Split / ChangePeer) belong to later projects.
+	}
+
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		panic(err)
+	}
+	if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+		panic(err)
+	}
+	d.notifyProposal(entry, resp, nil)
+}
+
+func (d *peerMsgHandler) execNormalRequest(req *raft_cmdpb.RaftCmdRequest, entry eraftpb.Entry) {
+	kvWB := new(engine_util.WriteBatch)
+	resp := newCmdResp()
+	BindRespTerm(resp, d.Term())
+	needSnap := false
+
+	// Re-check epoch at apply time so a stale command that lost leadership /
+	// region epoch races returns a proper region error instead of silently applying.
+	if err := util.CheckRegionEpoch(req, d.Region(), true); err != nil {
+		BindRespError(resp, err)
+		d.peerStorage.applyState.AppliedIndex = entry.Index
+		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+			panic(err)
+		}
+		if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+			panic(err)
+		}
+		d.notifyProposal(entry, resp, nil)
+		return
+	}
+
+	for _, r := range req.Requests {
+		switch r.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key := r.Get.GetKey()
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			// Flush pending writes so this Get observes earlier puts in the same request.
+			if kvWB.Len() > 0 {
+				if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+					panic(err)
+				}
+				kvWB = new(engine_util.WriteBatch)
+			}
+			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, r.Get.GetCf(), key)
+			if err == badger.ErrKeyNotFound {
+				val = nil
+			} else if err != nil {
+				panic(err)
+			}
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Get,
+				Get:     &raft_cmdpb.GetResponse{Value: val},
+			})
+		case raft_cmdpb.CmdType_Put:
+			put := r.GetPut()
+			if err := util.CheckKeyInRegion(put.GetKey(), d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			kvWB.SetCF(put.GetCf(), put.GetKey(), put.GetValue())
+			d.SizeDiffHint += uint64(len(put.GetKey()) + len(put.GetValue()))
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put,
+				Put:     &raft_cmdpb.PutResponse{},
+			})
+		case raft_cmdpb.CmdType_Delete:
+			del := r.GetDelete()
+			if err := util.CheckKeyInRegion(del.GetKey(), d.Region()); err != nil {
+				BindRespError(resp, err)
+				break
+			}
+			kvWB.DeleteCF(del.GetCf(), del.GetKey())
+			d.SizeDiffHint += uint64(len(del.GetKey()))
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete,
+				Delete:  &raft_cmdpb.DeleteResponse{},
+			})
+		case raft_cmdpb.CmdType_Snap:
+			needSnap = true
+			resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+			})
+		}
+		if resp.Header != nil && resp.Header.Error != nil {
+			break
+		}
+	}
+
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		panic(err)
+	}
+	if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+		panic(err)
+	}
+
+	var txn *badger.Txn
+	// Open the read txn only after all writes for this entry are durable.
+	if needSnap && (resp.Header == nil || resp.Header.Error == nil) {
+		txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+	}
+	d.notifyProposal(entry, resp, txn)
+}
+
+// notifyProposal matches a committed entry to a pending client proposal and
+// completes its callback. Stale proposals (overwritten after leader change)
+// receive ErrStaleCommand so the client can retry.
+func (d *peerMsgHandler) notifyProposal(entry eraftpb.Entry, resp *raft_cmdpb.RaftCmdResponse, txn *badger.Txn) {
+	for len(d.proposals) > 0 {
+		p := d.proposals[0]
+		if p.index < entry.Index {
+			NotifyStaleReq(d.Term(), p.cb)
+			d.proposals = d.proposals[1:]
+			continue
+		}
+		if p.index > entry.Index {
+			// Entry was proposed elsewhere (e.g. follower apply); nothing to answer.
+			return
+		}
+		// p.index == entry.Index
+		if p.term != entry.Term {
+			NotifyStaleReq(d.Term(), p.cb)
+		} else {
+			if txn != nil && p.cb != nil {
+				p.cb.Txn = txn
+			}
+			p.cb.Done(resp)
+		}
+		d.proposals = d.proposals[1:]
+		return
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -113,7 +338,27 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+	// Serialize the whole command; the Raft log only carries raw bytes.
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	// Record the callback tagged with the index this entry will occupy and the
+	// current term, so HandleRaftReady can find and answer it once applied.
+	// nextProposalIndex() == RaftLog.LastIndex()+1, computed before Propose appends.
+	p := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	d.proposals = append(d.proposals, p)
+	if err := d.RaftGroup.Propose(data); err != nil {
+		// Drop the dangling proposal so it is not answered later incorrectly.
+		d.proposals = d.proposals[:len(d.proposals)-1]
+		cb.Done(ErrResp(err))
+		return
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +468,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

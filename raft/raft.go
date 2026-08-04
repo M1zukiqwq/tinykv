@@ -272,17 +272,39 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if !ok {
 		return false
 	}
+	r.RaftLog.maybeCompact()
 
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
-		return false
+		var snapshot pb.Snapshot
+		var snapshotErr error
+		if r.RaftLog.pendingSnapshot != nil {
+			snapshot = *r.RaftLog.pendingSnapshot
+		} else {
+			snapshot, snapshotErr = r.RaftLog.storage.Snapshot()
+		}
+		if snapshotErr != nil || IsEmptySnap(&snapshot) {
+			return false
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType:  pb.MessageType_MsgSnapshot,
+			From:     r.id,
+			To:       to,
+			Term:     r.Term,
+			Snapshot: &snapshot,
+		})
+		return true
 	}
 
 	entries := make([]*pb.Entry, 0)
 	if pr.Next <= r.RaftLog.LastIndex() {
 		offset := r.RaftLog.entries[0].Index
-		for _, entry := range r.RaftLog.entries[pr.Next-offset:] {
+		start := pr.Next - offset
+		if start < 1 {
+			start = 1
+		}
+		for _, entry := range r.RaftLog.entries[start:] {
 			ent := entry
 			entries = append(entries, &ent)
 		}
@@ -497,6 +519,13 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 
+	case pb.MessageType_MsgSnapshot:
+		if m.Snapshot == nil || m.Snapshot.Metadata == nil || m.Term < r.Term {
+			return nil
+		}
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
+
 	case pb.MessageType_MsgAppendResponse:
 		if r.State != StateLeader || m.Term != r.Term {
 			return nil
@@ -575,6 +604,21 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		}
 
 		offset := r.RaftLog.entries[0].Index
+		// The entry before the in-memory log is the snapshot boundary. A
+		// leader must match that boundary in m.Index; accepting an entry at or
+		// before it would require slicing before the dummy entry and can only
+		// represent a stale or malformed AppendEntries request.
+		if entry.Index <= offset || entry.Index < m.Entries[0].Index {
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgAppendResponse,
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Index:   m.Index,
+				Reject:  true,
+			})
+			return
+		}
 		if entry.Index <= r.RaftLog.LastIndex() {
 			r.RaftLog.entries = r.RaftLog.entries[:entry.Index-offset]
 		}
@@ -624,7 +668,73 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	if m.Snapshot == nil || m.Snapshot.Metadata == nil {
+		return
+	}
+
+	snapshot := m.Snapshot
+	index := snapshot.Metadata.Index
+	term := snapshot.Metadata.Term
+	if index <= r.RaftLog.committed {
+		if m.From != None {
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgAppendResponse,
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Index:   r.RaftLog.committed,
+			})
+		}
+		return
+	}
+
+	// If the local log already contains the snapshot point, the state machine
+	// can catch up by applying its existing entries; no state transfer is
+	// needed.
+	if localTerm, err := r.RaftLog.Term(index); err == nil && localTerm == term {
+		r.RaftLog.committed = index
+		if m.From != None {
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgAppendResponse,
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Index:   r.RaftLog.LastIndex(),
+			})
+		}
+		return
+	}
+
+	// Replace the in-memory suffix with the snapshot boundary. The snapshot is
+	// intentionally kept pending until Ready has been persisted and applied by
+	// the upper layer.
+	snapshotCopy := *snapshot
+	r.RaftLog.pendingSnapshot = &snapshotCopy
+	r.RaftLog.entries = []pb.Entry{{Index: index, Term: term}}
+	r.RaftLog.committed = index
+	r.RaftLog.stabled = index
+
+	r.Prs = make(map[uint64]*Progress)
+	if snapshot.Metadata.ConfState != nil {
+		for _, id := range snapshot.Metadata.ConfState.Nodes {
+			progress := &Progress{Next: index + 1}
+			if id == r.id {
+				progress.Match = index
+			}
+			r.Prs[id] = progress
+		}
+	}
+	r.votes = make(map[uint64]bool)
+
+	if m.From != None {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   index,
+		})
+	}
 }
 
 // addNode add a new node to raft group

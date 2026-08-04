@@ -169,9 +169,13 @@ func (rn *RawNode) hardState() pb.HardState {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
+	rn.Raft.RaftLog.maybeCompact()
 	rd := Ready{
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
 	}
 	if len(rn.Raft.msgs) > 0 {
 		rd.Messages = rn.Raft.msgs
@@ -204,6 +208,9 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.RaftLog.nextEnts()) > 0 {
 		return true
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		return true
+	}
 	if len(rn.Raft.msgs) > 0 {
 		return true
 	}
@@ -225,6 +232,17 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		index := rd.Snapshot.Metadata.Index
+		if rn.Raft.RaftLog.applied < index {
+			rn.Raft.RaftLog.applied = index
+		}
+		if rn.Raft.RaftLog.stabled < index {
+			rn.Raft.RaftLog.stabled = index
+		}
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
+	rn.Raft.RaftLog.maybeCompact()
 	rn.Raft.msgs = nil
 }
 
