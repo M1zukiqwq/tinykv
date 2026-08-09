@@ -14,9 +14,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"path"
+	"reflect"
 	"sync"
 	"time"
 
@@ -278,9 +280,105 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
 
+	if region == nil {
+		return errors.New("invalid region heartbeat, region is nil")
+	}
+
+	origin := c.GetRegion(region.GetID())
+	// A heartbeat with an older region epoch is stale and must be rejected: with
+	// a partitioned cluster, an isolated node may keep reporting obsolete region
+	// information, which could otherwise overwrite the newer records (e.g. after
+	// a split or a conf change).
+	if origin != nil {
+		if err := checkRegionEpochStale(region, origin); err != nil {
+			return err
+		}
+	} else {
+		// The region is new to us. It must not be older than any region it
+		// overlaps with (e.g. the pre-split region covering the whole range).
+		for _, item := range c.core.GetOverlaps(region) {
+			if err := checkRegionEpochStale(region, item); err != nil {
+				return err
+			}
+		}
+	}
+
+	if isRegionInfoChanged(origin, region) {
+		// Update the region tree and the status of every involved store (both
+		// the old and the new peer set).
+		c.core.PutRegion(region)
+		storeIDs := make(map[uint64]struct{})
+		if origin != nil {
+			for id := range origin.GetStoreIds() {
+				storeIDs[id] = struct{}{}
+			}
+		}
+		for id := range region.GetStoreIds() {
+			storeIDs[id] = struct{}{}
+		}
+		for id := range storeIDs {
+			c.updateStoreStatusLocked(id)
+		}
+	}
+
+	// Feed the heartbeat to the cluster preparing checker.
+	c.prepareChecker.collect(region)
 	return nil
+}
+
+// checkRegionEpochStale reports whether the heartbeat region is older than the
+// recorded one by comparing the region epoch: a smaller version or conf_ver
+// means the heartbeat is stale.
+func checkRegionEpochStale(region, origin *core.RegionInfo) error {
+	heartbeatEpoch := region.GetRegionEpoch()
+	originEpoch := origin.GetRegionEpoch()
+	if heartbeatEpoch.GetVersion() < originEpoch.GetVersion() ||
+		heartbeatEpoch.GetConfVer() < originEpoch.GetConfVer() {
+		return ErrRegionIsStale(region.GetMeta(), origin.GetMeta())
+	}
+	return nil
+}
+
+// isRegionInfoChanged reports whether the heartbeat region carries information
+// different from the recorded one. Redundant heartbeats are skipped so that the
+// store status is not recomputed pointlessly.
+func isRegionInfoChanged(origin, region *core.RegionInfo) bool {
+	if origin == nil {
+		return true
+	}
+	regionEpoch := region.GetRegionEpoch()
+	originEpoch := origin.GetRegionEpoch()
+	if regionEpoch.GetVersion() > originEpoch.GetVersion() ||
+		regionEpoch.GetConfVer() > originEpoch.GetConfVer() {
+		return true
+	}
+	if !reflect.DeepEqual(region.GetPeers(), origin.GetPeers()) {
+		return true
+	}
+	if !reflect.DeepEqual(region.GetPendingPeers(), origin.GetPendingPeers()) {
+		return true
+	}
+	if !regionLeadersEqual(region.GetLeader(), origin.GetLeader()) {
+		return true
+	}
+	if region.GetApproximateSize() != origin.GetApproximateSize() {
+		return true
+	}
+	if !bytes.Equal(region.GetStartKey(), origin.GetStartKey()) ||
+		!bytes.Equal(region.GetEndKey(), origin.GetEndKey()) {
+		return true
+	}
+	return false
+}
+
+func regionLeadersEqual(a, b *metapb.Peer) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.GetId() == b.GetId()
 }
 
 func (c *RaftCluster) updateStoreStatusLocked(id uint64) {

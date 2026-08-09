@@ -396,7 +396,11 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, errors.New("cannot apply snapshot without a region worker")
 	}
 	startKey, endKey := snapData.Region.StartKey, snapData.Region.EndKey
-	if prevRegion != nil {
+	// Only clean the previous range when the peer was already initialized: an
+	// uninitialized peer (created by a conf change or split and not yet caught
+	// up) has a placeholder region with an empty range. Cleaning that "range"
+	// would wipe the whole store before the snapshot data is ingested.
+	if ps.isInitialized() && prevRegion != nil {
 		startKey, endKey = prevRegion.StartKey, prevRegion.EndKey
 	}
 	notifier := make(chan bool, 1)
