@@ -57,3 +57,23 @@
   - For each source store (up to `balanceRegionRetryLimit` tries) picks the region to move: pending region first, then follower, then leader.
   - Picks the first target store not already holding a peer of the region; a move is only valuable when the region has full replicas and `sourceSize - targetSize > 2 * regionApproxSize` (prevents immediate move-back), then creates a `CreateMovePeerOperator`.
 - Validation: `make project3c` passes; full `go test ./scheduler/...` (unit + integration) passes; gofmt/vet clean. `project3` is now fully complete (3A + 3B + 3C).
+
+## 2026-08-09 (project 4)
+
+- Completed Project 4 (transactions: MVCC + Percolator 2PC handlers). `make project4` (4A+4B+4C) passes; full `go test ./kv/transaction/... ./kv/server/...` passes; gofmt/vet clean.
+- Part 4A (`kv/transaction/mvcc/transaction.go`) — `MvccTxn`:
+  - `PutWrite`/`PutLock`/`DeleteLock`/`PutValue`/`DeleteValue` collect `storage.Modify` ops; lock CF uses the raw user key, default/write CF use `EncodeKey(key, ts)`.
+  - `GetLock` parses the lock value (nil when absent).
+  - `GetValue` walks the key's writes newest→oldest (write CF is ordered by user key asc then ts desc) and returns the value of the first write committed at or before `StartTS`; `WriteKindDelete` and writes committed later are skipped.
+  - `CurrentWrite` finds the write whose `StartTS` matches the txn (walking all versions); `MostRecentWrite` returns the newest write regardless of ts.
+- Part 4B (`kv/server/server.go`) — `KvGet`, `KvPrewrite`, `KvCommit`:
+  - All handlers latch the involved user keys (`Latches.WaitForLatches`/`ReleaseLatches`) and surface `raft_storage.RegionError` in the response.
+  - `KvGet`: lock check via `IsLockedFor` (lock ts <= request version ⇒ locked error), otherwise `GetValue`; `NotFound` when no visible value.
+  - `KvPrewrite`: per-key lock conflict (Locked error) and write conflict (`commitTs > StartTS` ⇒ `WriteConflict`); on success puts the lock (primary/ts/ttl/kind) and the value (Put) or delete marker (Del) at `StartTS`; on any error no writes are applied.
+  - `KvCommit`: idempotent — a current write that is already committed is skipped, a rollback marker aborts; missing lock ⇒ nothing to commit; lock owned by another txn ⇒ retryable error; otherwise `PutWrite` (commit ts, kind from lock) + `DeleteLock`.
+- Part 4C:
+  - `mvcc/scanner.go`: `Scanner` walks the write CF from `EncodeKey(startKey, TsMax)`; `Next` returns each user key's value valid at the txn's start ts, skipping rollback markers, writes committed after the snapshot, and values hidden by a newer delete; `nil, nil, nil` when exhausted.
+  - `KvScan`: streams pairs until `limit` reached (limit 0 ⇒ empty).
+  - `KvCheckTxnStatus`: lock present + `PhysicalTime(lock.Ts)+Ttl < PhysicalTime(CurrentTs)` ⇒ roll back primary (delete lock+value, write rollback marker, `Action_TTLExpireRollback`); otherwise `NoAction` + ttl. No lock: committed/rolled-back status from `CurrentWrite`, else write a rollback marker (`Action_LockNotExistRollback`).
+  - `KvBatchRollback`: per key, current rollback ⇒ no-op, current commit ⇒ abort error; lock owned by the txn is removed with its value; always leaves a rollback marker at `StartVersion`.
+  - `KvResolveLock`: collects all locks with `StartTS` via `AllLocksForTxn` and commits them (`CommitVersion`) or rolls them back (`CommitVersion == 0`).
